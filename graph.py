@@ -33,6 +33,7 @@ class Review(BaseModel):
 class ReviewState(TypedDict):
     code: str
     findings: Annotated[list[Finding], add]
+    verified: list[Finding]
 
 
 load_dotenv()
@@ -61,6 +62,16 @@ REVIEWERS = {
     "security": "security vulnerabilities",
     "standards": "code standards and style violations",
 }
+
+VERIFIER_SYSTEM = (
+    "You are a strict senior engineer auditing a junior's code review. "
+    "The code is shown as 'N | code'. You receive candidate findings as JSON. "
+    "Keep ONLY findings that are genuinely real and correctly located. Drop "
+    "false positives, duplicates, and anything you are not confident about. "
+    "Be skeptical: when in doubt, drop it.\n"
+    "Respond with ONLY a raw JSON object, no prose and no markdown fences, of "
+    'this exact shape: {"findings": [ ...the findings you keep, unchanged... ]}'
+)
 
 
 def number_lines(code: str) -> str:
@@ -91,17 +102,38 @@ def make_reviewer(category: str, focus: str):
     return review
 
 
+def verify(state: ReviewState) -> dict[str, list[Finding]]:
+    candidates = state["findings"]
+    if not candidates:
+        return {"verified": []}
+    payload = Review(findings=candidates).model_dump_json()
+    user = f"CODE:\n{number_lines(state['code'])}\n\nCANDIDATES:\n{payload}"
+    msg = reviewer_llm.invoke(
+        [
+            {"role": "system", "content": VERIFIER_SYSTEM},
+            {"role": "user", "content": user},
+        ]
+    )
+    return {"verified": parse_review(str(msg.content)).findings}
+
+
 builder = StateGraph(ReviewState)
+builder.add_node("verify", verify)
 for category, focus in REVIEWERS.items():
     name = f"review_{category}"
     builder.add_node(name, make_reviewer(category, focus))
     builder.add_edge(START, name)
-    builder.add_edge(name, END)
+    builder.add_edge(name, "verify")
+builder.add_edge("verify", END)
 graph = builder.compile()
 
 if __name__ == "__main__":
-    code = Path("snippets/s08_slugify.py").read_text()
-    initial: ReviewState = {"code": code, "findings": []}
-    result = graph.invoke(initial)
+    code = Path("snippets/s04_auth.py").read_text()
+    result = graph.invoke({"code": code, "findings": [], "verified": []})
+    print("RESULT", result)
+    print(f"NAIVE ({len(result['findings'])}):")
     for f in result["findings"]:
-        print(f"L{f.line_start}-{f.line_end} [{f.category}/{f.severity}] {f.message}")
+        print(f"  L{f.line_start}-{f.line_end} [{f.category}/{f.severity}] {f.message}")
+    print(f"VERIFIED ({len(result['verified'])}):")
+    for f in result["verified"]:
+        print(f"  L{f.line_start}-{f.line_end} [{f.category}/{f.severity}] {f.message}")
