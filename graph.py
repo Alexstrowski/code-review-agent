@@ -1,10 +1,14 @@
-from typing import Literal, cast, TypedDict
-from pydantic import BaseModel, Field, SecretStr
+from typing import Literal, TypedDict
+from pydantic import BaseModel, Field, SecretStr, model_validator, ValidationError
 import os
+import json
+import re
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from pathlib import Path
 from langgraph.graph import START, END, StateGraph
+from typing import Annotated
+from operator import add
 
 
 class Finding(BaseModel):
@@ -16,12 +20,19 @@ class Finding(BaseModel):
 
 
 class Review(BaseModel):
-    findings: list[Finding]
+    findings: list[Finding] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_shape(cls, data):
+        if isinstance(data, list):
+            return {"findings": data}
+        return data
 
 
 class ReviewState(TypedDict):
     code: str
-    findings: list[Finding]
+    findings: Annotated[list[Finding], add]
 
 
 load_dotenv()
@@ -31,41 +42,61 @@ reviewer_llm = ChatOpenAI(
     model="google/gemma-4-26b-a4b-it:free",
     base_url="https://openrouter.ai/api/v1",
     api_key=SecretStr(os.environ["OPENROUTER_API_KEY"]),
-).with_structured_output(Review, method="json_schema")
-
-
-REVIEWER_SYSTEM = (
-    "You are a meticulous code reviewer. Find real bugs, security issues, "
-    "and standards violations in the snippet below. The code is shown with "
-    "line numbers as 'N | code'. Report every issue you find with its exact "
-    "line range, a category (bug | security | standards), a severity "
-    "(low | medium | high), and a short message. Do not invent issues; if a "
-    "line is correct, do not report it."
 )
+
+
+REVIEWER_TEMPLATE = (
+    "You are a meticulous code reviewer specialized in {focus}. "
+    "The code is shown with line numbers as 'N | code'. "
+    "Report ONLY {focus}. Do not invent issues.\n"
+    "Respond with ONLY a raw JSON object, no prose and no markdown fences, "
+    "of this exact shape:\n"
+    '{{"findings": [{{"category": "{category}", "line_start": <int>, '
+    '"line_end": <int>, "severity": "<low|medium|high>", "message": "<short text>"}}]}}\n'
+    'If you find no issues, respond with {{"findings": []}}.'
+)
+
+REVIEWERS = {
+    "bug": "logic bugs and correctness errors",
+    "security": "security vulnerabilities",
+    "standards": "code standards and style violations",
+}
 
 
 def number_lines(code: str) -> str:
     return "\n".join(f"{i} | {line}" for i, line in enumerate(code.splitlines(), 1))
 
 
-def review_bugs(state: ReviewState) -> dict:
-    prompt = number_lines(state["code"])
-    review = cast(
-        Review,
-        reviewer_llm.invoke(
+def parse_review(content: str) -> Review:
+    text = re.sub(r"^```(?:json)?|```$", "", content.strip()).strip()
+    try:
+        return Review.model_validate(json.loads(text))
+    except (json.JSONDecodeError, ValidationError):
+        return Review()
+
+
+def make_reviewer(category: str, focus: str):
+    system = REVIEWER_TEMPLATE.format(focus=focus, category=category)
+
+    def review(state: ReviewState) -> dict[str, list[Finding]]:
+        prompt = number_lines(state["code"])
+        msg = reviewer_llm.invoke(
             [
-                {"role": "system", "content": REVIEWER_SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ]
-        ),
-    )
-    return {"findings": review.findings}
+        )
+        return {"findings": parse_review(str(msg.content)).findings}
+
+    return review
 
 
 builder = StateGraph(ReviewState)
-builder.add_node("review_bugs", review_bugs)
-builder.add_edge(START, "review_bugs")
-builder.add_edge("review_bugs", END)
+for category, focus in REVIEWERS.items():
+    name = f"review_{category}"
+    builder.add_node(name, make_reviewer(category, focus))
+    builder.add_edge(START, name)
+    builder.add_edge(name, END)
 graph = builder.compile()
 
 if __name__ == "__main__":
