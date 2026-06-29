@@ -5,6 +5,8 @@ import json
 import re
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
+from langchain_core.globals import set_llm_cache
+from langchain_community.cache import SQLiteCache
 from pathlib import Path
 from langgraph.graph import START, END, StateGraph
 from typing import Annotated
@@ -38,11 +40,16 @@ class ReviewState(TypedDict):
 
 load_dotenv()
 
+# Cache LLM responses on disk: identical (prompt, model) calls skip the API.
+# Makes eval re-runs free + reproducible. Delete the .db to force fresh calls.
+set_llm_cache(SQLiteCache(database_path=".langchain_cache.db"))
+
 
 reviewer_llm = ChatOpenAI(
     model="google/gemma-4-26b-a4b-it:free",
     base_url="https://openrouter.ai/api/v1",
     api_key=SecretStr(os.environ["OPENROUTER_API_KEY"]),
+    max_retries=6,
 )
 
 
