@@ -1,10 +1,15 @@
 import json
 import sys
+import time
 from pathlib import Path
-from graph import graph, Finding
 
-MIN_PRECISION = 0.0
-MIN_RECALL = 0.0
+from graph import build_graph
+from llm import bootstrap
+from models import Finding
+
+MIN_PRECISION = 0.35
+MIN_RECALL = 0.65
+SLEEP_SECONDS = 40
 
 
 def metrics(rows: list[tuple[int, int, int]]) -> tuple[int, int, int, float, float]:
@@ -32,6 +37,9 @@ def score(findings: list[Finding], seeded: list[dict]) -> tuple[int, int, int]:
 
 
 if __name__ == "__main__":
+    bootstrap()
+    graph = build_graph()
+
     golden = [
         json.loads(line)
         for line in Path("golden_bugs.jsonl").read_text().splitlines()
@@ -41,12 +49,17 @@ if __name__ == "__main__":
     naive_rows, verified_rows = [], []
     for entry in golden:
         code = Path(entry["file"]).read_text()
+        t0 = time.monotonic()
         result = graph.invoke({"code": code, "findings": [], "verified": []})
+        was_cached = time.monotonic() - t0 < 3  # instantáneo ⇒ vino del caché
         naive_rows.append(score(result["findings"], entry["bugs"]))
         verified_rows.append(score(result["verified"], entry["bugs"]))
+        tag = " (cached)" if was_cached else ""
         print(
-            f"{entry['id']}: naive={len(result['findings'])} verified={len(result['verified'])}"
+            f"{entry['id']}: naive={len(result['findings'])} verified={len(result['verified'])}{tag}"
         )
+        if not was_cached:  # solo throttlea cuando la llamada fue real
+            time.sleep(SLEEP_SECONDS)
 
     print()
     for label, rows in [("NAIVE", naive_rows), ("VERIFIED", verified_rows)]:
